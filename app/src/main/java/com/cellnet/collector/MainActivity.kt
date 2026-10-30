@@ -201,6 +201,7 @@ class MainActivity : Activity() {
         etPaste.textSize = 12f
         connect.addSpaced(etPaste)
         connect.addSpaced(button("Pair with pasted text") { pairFromText(etPaste.text.toString()) })
+        connect.addSpaced(button("Test laptop connection") { testConnection() })
         btnUnpair = button("Unpair this phone") { unpair() }
         connect.addSpaced(btnUnpair)
         root.addSpaced(connect, 12)
@@ -321,7 +322,9 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------ small helpers
 
     private fun isPrivateHost(h: String): Boolean {
-        val parts = h.split(".")
+        val host = h.trim().lowercase()
+        if (host.endsWith(".local")) return true
+        val parts = host.split(".")
         if (parts.size != 4) return false
         val n = ArrayList<Int>()
         for (p in parts) {
@@ -329,7 +332,10 @@ class MainActivity : Activity() {
             if (x !in 0..255) return false
             n.add(x)
         }
-        return n[0] == 10 || (n[0] == 172 && n[1] in 16..31) || (n[0] == 192 && n[1] == 168)
+        return n[0] == 10 ||
+            (n[0] == 172 && n[1] in 16..31) ||
+            (n[0] == 192 && n[1] == 168) ||
+            (n[0] == 169 && n[1] == 254)
     }
 
     private fun errText(r: ApiResult): String {
@@ -357,9 +363,15 @@ class MainActivity : Activity() {
             .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
             .build()
         GmsBarcodeScanning.getClient(this, options).startScan()
-            .addOnSuccessListener { b -> pairFromText(b.rawValue) }
+            .addOnSuccessListener { b ->
+                val raw = b.rawValue
+                if (raw.isNullOrBlank()) say("The QR code was empty. Paste the pairing text instead.")
+                else pairFromText(raw)
+            }
+            .addOnCanceledListener { say("Scan cancelled.") }
             .addOnFailureListener { e ->
-                say("Scan failed: ${e.message}. You can paste the pairing text instead.")
+                say("Scanner failed: ${e.message}. It needs Google Play Services and internet the first time. " +
+                    "You can paste the pairing text instead.")
             }
     }
 
@@ -369,22 +381,32 @@ class MainActivity : Activity() {
             return
         }
         val obj = try { JSONObject(text.trim()) } catch (e: Exception) {
-            say("This is not a CellNet pairing code.")
+            say("This is not a CellNet pairing code. It starts with: " + text.trim().take(40))
             return
         }
-        val host = obj.optString("host")
-        val port = obj.optInt("port", 5000)
-        val token = obj.optString("token")
-        if (obj.optInt("v") != 1 || host.isEmpty() || token.isEmpty() || port !in 1..65535) {
-            say("This pairing code is not valid.")
+        val host = obj.optString("host").trim()
+        val port = obj.optString("port", "5000").toIntOrNull() ?: 5000
+        var token = obj.optString("token")
+        if (token.isEmpty()) token = obj.optString("pairing_token")
+        if (host.isEmpty() || token.isEmpty() || port !in 1..65535) {
+            say("Pairing code is missing host, port or token. Found keys: " +
+                obj.keys().asSequence().joinToString(", "))
             return
         }
         if (!isPrivateHost(host)) {
-            say("The address $host is not on a local network, so the app will not connect to it.")
+            say("The address \"$host\" is not a local network address. Use the laptop's Wi-Fi IP like 192.168.x.x, not localhost.")
             return
         }
-        say("Pairing...")
+        say("Checking the laptop at $host:$port ...")
         executor.execute {
+            val health = Api.get(host, port, "/health")
+            if (health.code != 200) {
+                runOnUiThread {
+                    say("Cannot reach the laptop at $host:$port (${errText(health)}). Check: same Wi-Fi, receiver running on 0.0.0.0, " +
+                        "Windows Firewall allows port $port, and the app allows http traffic.")
+                }
+                return@execute
+            }
             val body = JSONObject()
                 .put("pairing_token", token)
                 .put("device_uid", store.deviceUid)
@@ -400,8 +422,25 @@ class MainActivity : Activity() {
                     say("Paired. Saved sessions can now be sent to the laptop.")
                     if (running && serverSessionId < 0) tryOpenServerSession(localSessionId, activeName)
                 } else {
-                    say("Pairing failed: ${errText(r)}. Is the receiver running, and are both devices on the same network?")
+                    say("Laptop reached, but pairing was refused (HTTP ${r.code}): ${errText(r)}. " +
+                        "The pairing code may have expired or been used already. Generate a new QR on the dashboard.")
                 }
+            }
+        }
+    }
+
+    private fun testConnection() {
+        val host = store.host
+        if (host == null) {
+            say("Not paired yet.")
+            return
+        }
+        say("Testing...")
+        executor.execute {
+            val r = Api.get(host, store.port, "/health")
+            runOnUiThread {
+                say(if (r.code == 200) "Laptop reachable at $host:${store.port}."
+                else "Cannot reach $host:${store.port}: ${errText(r)}")
             }
         }
     }
